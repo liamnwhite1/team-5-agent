@@ -16,7 +16,9 @@ Extend these as you implement your agent: every input-validation branch and
 every distinct result shape deserves a test. Run with `uv run pytest`.
 """
 
-from agent import Team5TablePlotAgent
+from unittest.mock import AsyncMock
+
+from agent import PLOT_SKILL, Team5TablePlotAgent
 
 
 def _make_agent() -> Team5TablePlotAgent:
@@ -28,18 +30,22 @@ def _make_agent() -> Team5TablePlotAgent:
 async def test_execute_returns_success_for_valid_input(context, event_queue):
     agent = _make_agent()
 
-    result = await agent._execute({"input_data": "hello"}, context, event_queue)
+    agent.send_status_update = AsyncMock()
+    agent._plot_table = AsyncMock(return_value={"status": "success", "artifact_id": "plot-1"})
+    params = {"skill_id": PLOT_SKILL, "table_artifact_id": "table-1"}
+    result = await agent._execute(params, context, event_queue)
 
     assert result["status"] == "success"
-    assert result["input_received"] == "hello"
-    # The progress update was emitted through the event queue.
-    assert event_queue.enqueue_event.await_count >= 1
+    assert result["artifact_id"] == "plot-1"
+    agent._plot_table.assert_awaited_once_with(params, context, event_queue)
+    agent.send_status_update.assert_awaited_once()
 
 
 async def test_execute_rejects_missing_input(context, event_queue):
     agent = _make_agent()
+    agent.send_status_update = AsyncMock()
 
     result = await agent._execute({}, context, event_queue)
 
     assert result["status"] == "error"
-    assert "input_data" in result["error"]
+    assert "table_artifact_id" in result["error"]

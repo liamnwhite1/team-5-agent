@@ -17,6 +17,7 @@ with the caption written above it, and the small LLM picks the one the user
 described. Plotting: see ``_plot_table``.
 """
 
+import csv
 import json
 import logging
 import math
@@ -135,33 +136,65 @@ def _caption(paragraph) -> str:
     return _plain_text(children)
 
 
+def _cells_as_written(line: str) -> int:
+    """How many cells a table row has in the source, before the parser pads or cuts it.
+
+    Cells are split on pipes, except escaped ones (\\|) and the optional outer pipes.
+    """
+    text = line.strip()
+    if text.startswith("|"):
+        text = text[1:]
+    if text.endswith("|") and not text.endswith("\\|"):
+        text = text[:-1]
+    return len(re.split(r"(?<!\\)\|", text))
+
+
 def find_tables(markdown: str) -> list[dict[str, Any]]:
     """Every table in a markdown document, with the caption written above it.
 
     Each table is a dict with its caption, section (the heading it sits under),
     columns and rows. Cells keep the text as written in the document.
+
+    The markdown rules quietly pad a short row, cut a long one, and end a
+    table at a blank line, which would hand back wrong numbers without any
+    error. Those cases are recorded in the table's "problem" instead.
     """
+    lines = markdown.splitlines()
     tokens = MarkdownIt("commonmark").enable("table").parse(markdown)
     tables: list[dict[str, Any]] = []
     section = caption = ""
-    row = None
+    row = row_line = None
     for i, token in enumerate(tokens):
         if token.type == "table_open":
-            tables.append({"caption": caption, "section": section, "columns": [], "rows": []})
+            tables.append(
+                {"caption": caption, "section": section, "columns": [], "rows": [], "problem": ""}
+            )
         elif token.type == "tr_open":
-            row = []
+            row, row_line = [], token.map[0]
         elif token.type == "inline" and row is not None:  # one table cell
             row.append(_plain_text(token.children or []))
         elif token.type == "tr_close":
             table = tables[-1]
-            if table["columns"]:
-                table["rows"].append(row)
-            else:
+            if not table["columns"]:
                 table["columns"] = row
+            else:
+                table["rows"].append(row)
+                written = _cells_as_written(lines[row_line])
+                if written != len(table["columns"]) and not table["problem"]:
+                    table["problem"] = (
+                        f"row {len(table['rows'])} (line {row_line + 1}) has {written} cells "
+                        f"but the header has {len(table['columns'])}"
+                    )
             row = None
         elif token.level == 0 and token.type == "heading_open":
             section = caption = _plain_text(tokens[i + 1].children or [])
         elif token.level == 0 and token.type == "paragraph_open":
+            first_line = lines[token.map[0]].lstrip()
+            if tokens[i - 1].type == "table_close" and first_line.startswith("|"):
+                tables[-1]["problem"] = tables[-1]["problem"] or (
+                    f"a blank line at line {token.map[0]} cuts it short, so the rows "
+                    "after it are not part of the table"
+                )
             caption = _caption(tokens[i + 1])
         if token.level == 0 and token.type in CAPTION_BREAKERS:
             caption = ""  # a caption belongs only to the table right below it
@@ -207,6 +240,42 @@ def _artifact_name(caption: str, position: int) -> str:
     """A short name with no file extension, so the plotter reads the table as JSON."""
     slug = re.sub(r"[^a-z0-9]+", "_", caption.lower()).strip("_")[:50].rstrip("_")
     return slug or f"table_{position}"
+
+
+def _csv_problem(path: Path) -> str:
+    """What is wrong with a CSV file, or "" if nothing is.
+
+    pandas reads a malformed file by guessing: it pads a short row, makes the
+    first column the index when the first row is too long, and renames a
+    repeated column name to "name.1". The plot would then show shifted values
+    without an error, so the file is checked before pandas reads it.
+    """
+    try:
+        with path.open(encoding="utf-8-sig", newline="") as handle:
+            reader = csv.reader(handle, strict=True)
+            # Like pandas, skip lines that are empty or hold only spaces.
+            rows = [(reader.line_num, row) for row in reader if len(row) > 1 or "".join(row).strip()]
+    except UnicodeDecodeError:
+        return 'it is not UTF-8 text (in Excel, save it as "CSV UTF-8")'
+    except csv.Error as error:
+        return f"it is not valid CSV ({error})"
+    if not rows:
+        return "it is empty"
+    header = rows[0][1]
+    if len(header) == 1 and ("\t" in header[0] or ";" in header[0]):
+        separator = "tabs" if "\t" in header[0] else "semicolons"
+        return f"its columns are separated by {separator}, not commas"
+    names = [name.strip() for name in header if name.strip()]
+    repeated = [name for name in names if names.count(name) > 1]
+    if repeated:
+        return f"more than one column is named '{repeated[0]}'"
+    if names and all(isinstance(_clean_cell(name), (int, float)) for name in names):
+        return "its first row is data, not column names"
+    for number, (line, row) in enumerate(rows[1:], start=1):
+        if len(row) != len(header):
+            fields = "field" if len(row) == 1 else "fields"
+            return f"row {number} (line {line}) has {len(row)} {fields} but the header has {len(header)}"
+    return ""
 
 
 class Team5TablePlotAgent(PrometheusAgent):
@@ -288,6 +357,11 @@ class Team5TablePlotAgent(PrometheusAgent):
 
         table = tables[index]
         caption = table["caption"]
+        if table["problem"]:
+            return _error(
+                f"The table '{caption or f'table {index + 1}'}' in '{source}' is not well-formed "
+                f"markdown: {table['problem']}. Fix the table and upload the document again."
+            )
         columns = _unique_names(table["columns"])
         rows = [[_clean_cell(cell) for cell in row] for row in table["rows"]]
         artifact_id = await self.send_json_artifact(
@@ -380,6 +454,12 @@ class Team5TablePlotAgent(PrometheusAgent):
                 frame = pd.DataFrame(body["rows"], columns=body["columns"])
                 caption = _text(body.get("caption"))
             elif path.suffix.lower() == ".csv":
+                problem = _csv_problem(path)
+                if problem:
+                    return _error(
+                        f"The CSV file cannot be read as a table: {problem}. "
+                        "Fix the file and upload it again."
+                    )
                 frame = pd.read_csv(path, encoding="utf-8-sig", dtype=str)
             else:
                 return _error("Please provide a CSV file or a JSON table with columns and rows.")

@@ -12,7 +12,7 @@ import pytest
 from matplotlib import image as mpimg
 from matplotlib.figure import Figure
 
-from agent import Team5TablePlotAgent, _column_label
+from agent import Team5TablePlotAgent, _column_label, _csv_problem
 
 FIXTURES = Path(__file__).parent
 OUTPUT = FIXTURES / "output"
@@ -311,6 +311,83 @@ async def test_bad_input_data(plot_agent, tmp_path, context, event_queue, conten
     assert result["status"] == "error"
     assert expected in result["error"]
     plot_agent.agent.send_deeplynx_artifact.assert_not_awaited()
+
+
+@pytest.mark.parametrize("contents, problem", [
+    # A field too few or too many: pandas would pad the row or shift whole columns.
+    ("night,mice,temp\n1,14,4.1\n2,4.3\n", "row 2 (line 3) has 2 fields but the header has 3"),
+    ("night,mice,temp\n1,14,4.1,99\n2,19,4.3\n", "row 1 (line 2) has 4 fields but the header has 3"),
+    ("night,mice,temp\n1,14,4.1,\n2,19,4.3,\n", "row 1 (line 2) has 4 fields but the header has 3"),
+    ("year,population\n2042,1,019\n", "row 1 (line 2) has 3 fields but the header has 2"),
+    ("night,mice\n1,14\n\n2,19,7\n", "row 2 (line 4) has 3 fields but the header has 2"),
+    ("night,mice,temp\n1,14,4.1\noops\n", "row 2 (line 3) has 1 field but the header has 3"),
+    ("Mouse sightings\nnight,mice\n1,14\n", "row 1 (line 2) has 2 fields but the header has 1"),
+    # Read as one column, or under column names pandas would invent.
+    ("night;temp\n1;4,1\n", "its columns are separated by semicolons, not commas"),
+    ("night\tmice\n1\t14\n", "its columns are separated by tabs, not commas"),
+    ("night,temp,temp \n1,4.1,9.0\n", "more than one column is named 'temp'"),
+    ("1,14,4.1\n2,19,4.3\n", "its first row is data, not column names"),
+    # Not readable as CSV text.
+    ("", "it is empty"),
+    ("\n  \n", "it is empty"),
+    ('night,mice\n1,"14\n', "it is not valid CSV (unexpected end of data)"),
+    (
+        "night,temp \xb0C\n1,4.1\n".encode("latin-1"),
+        'it is not UTF-8 text (in Excel, save it as "CSV UTF-8")',
+    ),
+])
+def test_csv_problems_are_named(tmp_path, contents, problem):
+    path = tmp_path / "data.csv"
+    path.write_bytes(contents if isinstance(contents, bytes) else contents.encode())
+    assert _csv_problem(path) == problem
+
+
+@pytest.mark.parametrize("contents", [
+    'night,mice\n1,"1,014"\n',  # a quoted thousands separator
+    "night,mice,,\n1,14,,\n",  # trailing commas: blank column names, not repeated ones
+    "﻿night,mice\r\n1,14\r\n\r\n  \r\n2,19\r\n",  # BOM, CRLF, blank lines
+    "night,mice\n1,14\n2,\n",  # an empty field is a missing value
+    "night,2042\n1,14\n",  # a number may be one of the column names
+])
+def test_well_formed_csv_has_no_problem(tmp_path, contents):
+    path = tmp_path / "data.csv"
+    path.write_bytes(contents.encode())
+    assert _csv_problem(path) == ""
+
+
+async def test_a_malformed_csv_is_an_error_not_a_shifted_plot(
+    plot_agent, tmp_path, context, event_queue,
+):
+    path = tmp_path / "sightings.csv"
+    path.write_text("night,mice,temp\n1,14,4.1\n2,4.3\n")  # pandas would plot 4.3 mice on night 2
+    plot_agent.agent.get_artifact_file_path.return_value = path
+    result = await plot_agent.agent._plot_table({
+        "table_artifact_id": "sightings", "x_column": "night", "y_column": "mice",
+    }, context, event_queue)
+    assert result == {
+        "status": "error",
+        "error": "The CSV file cannot be read as a table: row 2 (line 3) has 2 fields "
+                 "but the header has 3. Fix the file and upload it again.",
+    }
+    plot_agent.agent.send_deeplynx_artifact.assert_not_awaited()
+
+
+@pytest.mark.parametrize("contents, expected_y", [
+    ('night,mice\n1,"1,014"\n2,"1,019"\n', [1014, 1019]),
+    ("night,mice,,\n1,14,,\n2,19,,\n", [14, 19]),
+    ("﻿night,mice\r\n1,14\r\n\r\n  \r\n2,19\r\n", [14, 19]),
+])
+async def test_csv_quirks_that_are_not_errors_still_plot(
+    plot_agent, tmp_path, context, event_queue, contents, expected_y,
+):
+    path = tmp_path / "sightings.csv"
+    path.write_bytes(contents.encode())
+    plot_agent.agent.get_artifact_file_path.return_value = path
+    result = await plot_agent.agent._plot_table({
+        "table_artifact_id": "sightings", "x_column": "night", "y_column": "mice",
+    }, context, event_queue)
+    assert result["status"] == "success"
+    assert list(plot_agent.figures[0].axes[0].lines[0].get_ydata()) == expected_y
 
 
 @pytest.mark.parametrize("partial", [False, True], ids=["complete-form", "partial-form"])

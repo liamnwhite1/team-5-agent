@@ -190,3 +190,53 @@ async def test_the_plotter_reads_the_extracted_table(extract_agent, context, eve
     assert result["status"] == "success"
     assert upload.await_args.kwargs["description"] == "Brie Basin (residents) vs Year"
     assert upload.await_args.kwargs["metadata"]["source_caption"].startswith("Table 2. Census")
+
+
+# Malformed tables: the markdown rules would pad, cut or end them quietly.
+HEADER = "**Table 2. Census.**\n\n| Year | Gouda | Brie | Mice |\n|---|---|---|---|\n"
+
+
+@pytest.mark.parametrize(
+    ("row", "cells"),
+    [
+        ("| 2042 | 412 | 350 |", 3),  # a missing cell would shift values left
+        ("| 2042 | 412 | 188 | 350 | 99 |", 5),  # an extra cell would be dropped
+        ("| 2042 | 412 | 1|88 | 350 |", 5),  # an unescaped pipe splits a cell
+    ],
+)
+def test_rows_with_the_wrong_number_of_cells_are_flagged(row, cells):
+    (table,) = find_tables(HEADER + row + "\n")
+
+    assert table["problem"] == f"row 1 (line 5) has {cells} cells but the header has 4"
+
+
+def test_a_blank_line_inside_a_table_is_flagged():
+    text = HEADER + "| 2042 | 412 | 188 | 350 |\n\n| 2043 | 467 | 203 | 420 |\n"
+
+    (table,) = find_tables(text)
+
+    assert table["problem"].startswith("a blank line at line 6 cuts it short")
+
+
+def test_well_formed_tables_have_no_problem():
+    assert [table["problem"] for table in find_tables(REPORT.read_text())] == ["", "", ""]
+    # An escaped pipe belongs to its cell, and prose may follow a table.
+    (table,) = find_tables(HEADER + "| 2042 | 4\\|12 | 188 | 350 |\n\nSome prose.\n")
+    assert table["problem"] == ""
+
+
+async def test_a_malformed_table_is_an_error_only_when_picked(extract_agent, context, event_queue, tmp_path):
+    document = tmp_path / "report.md"
+    document.write_text(HEADER + "| 2042 | 412 | 350 |\n\n**Table 3. Other.**\n\n| A |\n|---|\n| 1 |\n")
+    extract_agent.get_artifact_file_path.return_value = document
+    params = {"document_artifact_id": "doc", "table_description": "the census"}
+
+    extract_agent._pick_table.return_value = (0, "Census.")
+    broken = await extract_agent._extract_table(params, context, event_queue)
+    extract_agent._pick_table.return_value = (1, "Other.")
+    fine = await extract_agent._extract_table(params, context, event_queue)
+
+    assert broken["status"] == "error"
+    assert "'Table 2. Census.'" in broken["error"] and "not well-formed markdown" in broken["error"]
+    assert "row 1 (line 5) has 3 cells but the header has 4" in broken["error"]
+    assert fine["status"] == "success" and fine["caption"] == "Table 3. Other."

@@ -37,6 +37,26 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+EXTRACT_SKILL = "team_5_extract_table"
+PLOT_SKILL = "team_5_plot_table"
+
+##########################
+# Helper/Utility Functions
+##########################
+
+# Text cleaning
+def _text(value: Any) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+def _error(message: str) -> dict[str, Any]:
+    """A problem the user or the orchestrator can fix: reported, not raised.
+
+    The orchestrator hands the model only the ``error`` text, so everything it
+    needs to correct the call (real captions, real column names) goes in there.
+    """
+    return {"status": "error", "error": message}
+
+##########################
 
 class Team5TablePlotAgent(PrometheusAgent):
     """Team-5 Table Plot Agent."""
@@ -110,17 +130,21 @@ class Team5TablePlotAgent(PrometheusAgent):
         # ------------------------------------------------------------------
         # 3. Do your actual work here.  Replace this with real logic.
         # ------------------------------------------------------------------
-        result = {
-            "status": "success",
-            "input_received": input_data,
-            "message": "Replace this with your agent's processing logic.",
+        """Dispatch on the skill the orchestrator selected."""
+        handlers = {
+            EXTRACT_SKILL: self._extract_table,
+            PLOT_SKILL: self._plot_table,
         }
+        skill_id = _text(params.get("skill_id"))
+        if not skill_id:
+            # A direct call without routing metadata (the /api/chat debug route).
+            skill_id = EXTRACT_SKILL if params.get("document_artifact_id") else PLOT_SKILL
+        handler = handlers.get(skill_id)
+        if handler is None:
+            return _error(f"Unknown skill '{skill_id}'. This agent offers: {', '.join(handlers)}.")
 
-        # ------------------------------------------------------------------
-        # 4. Return a plain dict.  Keep keys consistent with the
-        #    "output_format" you described in agent_card.json.
-        # ------------------------------------------------------------------
-        return result
+        # Call skill
+        return await handler(params, context, event_queue)
 
     # ----------------------------------------------------------------------
     # PATTERNS — uncomment and adapt as needed.

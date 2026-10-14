@@ -432,7 +432,9 @@ class Team5TablePlotAgent(PrometheusAgent):
         options = dict(pending)
         for values in (params, provided):
             for key, value in values.items():
-                if key in {"table_artifact_id", "x_column", "y_column", "title", "kind"} and not _text(value):
+                if key in {
+                    "table_artifact_id", "x_column", "y_column", "title", "kind", "x_scale", "y_scale",
+                } and (value is None or isinstance(value, str) and not value.strip()):
                     continue
                 options[key] = value
         table_id = _text(options.get("table_artifact_id"))
@@ -441,6 +443,11 @@ class Team5TablePlotAgent(PrometheusAgent):
         kind = options.get("kind") or "line"
         if kind not in {"line", "scatter", "bar"}:
             return _error("kind must be line, scatter, or bar.")
+        x_scale = options.get("x_scale") or "linear"
+        y_scale = options.get("y_scale") or "linear"
+        for key, scale in (("x_scale", x_scale), ("y_scale", y_scale)):
+            if scale not in ("linear", "log"):
+                return _error(f"{key} must be linear or log.")
 
         try:
             path = await self.get_artifact_file_path(
@@ -523,12 +530,22 @@ class Team5TablePlotAgent(PrometheusAgent):
         valid = x.notna() & y.notna()
         if not valid.any():
             return _error("The selected columns have no rows with both x and y values.")
+        if x_scale == "log" and not numeric_x:
+            return _error(f"Column '{x_col}' must be numeric for a logarithmic x axis.")
+        for column, values, scale in ((x_col, x, x_scale), (y_col, y, y_scale)):
+            if scale == "log" and (values[valid] <= 0).any():
+                return _error(
+                    f"Column '{column}' contains zero or negative values. "
+                    "A logarithmic axis requires strictly positive values; use a linear scale instead."
+                )
 
         x_label, y_label = _column_label(x_col), _column_label(y_col)
         title = _text(options.get("title")) or f"{y_label} vs {x_label}"
         figure = Figure(figsize=(8, 5), layout="constrained")
         FigureCanvasAgg(figure)
         axes = figure.subplots()
+        # Set scales before categorical ticks; changing scales resets tick locators.
+        axes.set(xscale=x_scale, yscale=y_scale)
         if kind == "bar" and not numeric_x:
             # One position per row keeps repeated category names from overlapping.
             labels = x[valid].astype(str).tolist()
@@ -568,6 +585,8 @@ class Team5TablePlotAgent(PrometheusAgent):
             "x_column": x_col,
             "y_column": y_col,
             "kind": kind,
+            "x_scale": x_scale,
+            "y_scale": y_scale,
         }
 
 if __name__ == "__main__":

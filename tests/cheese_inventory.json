@@ -1,0 +1,9 @@
+{
+  "caption": "Cheese inventory by variety",
+  "columns": ["cheese", "stock_kg"],
+  "rows": [
+    ["Gouda", 1020],
+    ["Brie", 650.5],
+    ["Cheddar", 0]
+  ]
+}

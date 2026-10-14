@@ -4,16 +4,8 @@ version = "0.1.0"
 description = "Extracts and publishes a table that can be plotted."
 requires-python = ">=3.12"
 dependencies = [
-    # List only packages YOUR agent code imports directly.
-    #
-    # prometheus_api (and a2a, starlette, uvicorn) are already installed in the
-    # base Docker image — do NOT list them here, or you'll install a second,
-    # possibly conflicting copy.
-    #
-    # Examples:
-    #   "anthropic>=0.18.0",   # if you call Claude directly
-    #   "httpx>=0.26.0",       # if you call external HTTP APIs
-    #   "numpy>=1.26.0",       # if you use NumPy
+    "matplotlib>=3.9",
+    "pandas>=2.2",
 ]
 
 [dependency-groups]

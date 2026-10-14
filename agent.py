@@ -10,43 +10,31 @@
 #
 # SPDX-License-Identifier: MIT
 
-"""
-Team-5 Table Plot Agent.
+"""Team-5 agent for extracting tables and plotting tabular artifacts."""
 
-Extracts and publishes a table that can be plotted.
-
-This is a Prometheus specialist agent.  Subclass PrometheusAgent and implement
-`_execute` — the base class handles the HTTP server, authentication, agent-card
-serving, and registry registration for you.
-"""
-
+import json
 import logging
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
-from prometheus_api import load_prompt  # noqa: F401 - used by the LLM pattern below
-from prometheus_api.agent import EventQueue, PrometheusAgent, RequestContext
-
-# Read secrets and configuration from environment variables.
-# Never hard-code API keys or URLs here.
-# Example (add `import os` to the imports above):
-#   MY_API_KEY = os.getenv("MY_API_KEY")
+import pandas as pd
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.figure import Figure
+from prometheus_api.agent import EventQueue, MissingInput, PrometheusAgent, RequestContext
+from prometheus_api.storage_client.connection import ConnectionConfig
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
-logger = logging.getLogger(__name__)
 
 EXTRACT_SKILL = "team_5_extract_table"
 PLOT_SKILL = "team_5_plot_table"
 
-##########################
-# Helper/Utility Functions
-##########################
-
-# Text cleaning
 def _text(value: Any) -> str:
     return value.strip() if isinstance(value, str) else ""
+
 
 def _error(message: str) -> dict[str, Any]:
     """A problem the user or the orchestrator can fix: reported, not raised.
@@ -56,37 +44,9 @@ def _error(message: str) -> dict[str, Any]:
     """
     return {"status": "error", "error": message}
 
-##########################
 
 class Team5TablePlotAgent(PrometheusAgent):
     """Team-5 Table Plot Agent."""
-
-    # Optional: register agent-owned HTTP endpoints in __init__.
-    #
-    # def __init__(self, *args: Any, **kwargs: Any) -> None:
-    #     super().__init__(*args, **kwargs)
-    #     self.add_http_endpoint(
-    #         "/api/preview/{artifact_id}",
-    #         self.preview_artifact,
-    #         methods=["GET"],
-    #         endpoint_id="artifact_preview",
-    #         purpose="artifact",
-    #         description="Return preview metadata for one artifact.",
-    #         content_types=["application/json"],
-    #     )
-    #     self.add_static_endpoint(
-    #         "/viewer",
-    #         "viewer-assets",
-    #         endpoint_id="viewer_assets",
-    #         purpose="viewer_plugin",
-    #         description="Serve viewer plugin JavaScript and CSS.",
-    #         content_types=["text/javascript", "text/css"],
-    #     )
-    #
-    # async def preview_artifact(self, request):
-    #     from starlette.responses import JSONResponse
-    #
-    #     return JSONResponse({"artifact_id": request.path_params["artifact_id"]})
 
     async def _execute(
         self,
@@ -94,89 +54,158 @@ class Team5TablePlotAgent(PrometheusAgent):
         context: RequestContext,
         event_queue: EventQueue,
     ) -> dict[str, Any]:
-        """Process one request.
-
-        Args:
-            params: Parameters from the caller's JSON payload, plus ``skill_id``
-                from the message metadata (the skill the orchestrator selected).
-            context: The A2A request context.  Use ``context.context_id`` as a
-                stable key for per-conversation state.
-            event_queue: Pass to the ``send_*`` helpers to emit progress updates
-                and artifacts.
-
-        Returns:
-            A plain ``dict``.  The base class wraps it as the final ``completed``
-            task status automatically — do not enqueue that event yourself.
-        """
-        # ------------------------------------------------------------------
-        # 1. Read inputs from params.  These keys must match the properties
-        #    declared in agent_card.json's inputSchema.
-        # ------------------------------------------------------------------
-        input_data = params.get("input_data")
-        if not input_data:
-            return {"status": "error", "error": "input_data is required"}
-
-        # ------------------------------------------------------------------
-        # 2. Send optional progress updates so the UI stays responsive.
-        #    The base class sends the initial "working" update automatically;
-        #    call this only when you want intermediate messages.
-        # ------------------------------------------------------------------
+        """Route a request to the selected skill handler."""
         await self.send_status_update(
             context=context,
             event_queue=event_queue,
             message="Processing your request…",
         )
 
-        # ------------------------------------------------------------------
-        # 3. Do your actual work here.  Replace this with real logic.
-        # ------------------------------------------------------------------
-        """Dispatch on the skill the orchestrator selected."""
+        # Dispatch on the skill the orchestrator selected.
         handlers = {
-            EXTRACT_SKILL: self._extract_table,
-            PLOT_SKILL: self._plot_table,
+            EXTRACT_SKILL: "_extract_table",
+            PLOT_SKILL: "_plot_table",
         }
         skill_id = _text(params.get("skill_id"))
         if not skill_id:
             # A direct call without routing metadata (the /api/chat debug route).
             skill_id = EXTRACT_SKILL if params.get("document_artifact_id") else PLOT_SKILL
-        handler = handlers.get(skill_id)
-        if handler is None:
+        if skill_id not in handlers:
             return _error(f"Unknown skill '{skill_id}'. This agent offers: {', '.join(handlers)}.")
+        handler = getattr(self, handlers[skill_id], None)
+        if handler is None:
+            return _error(f"Skill '{skill_id}' is not implemented yet.")
 
-        # Call skill
         return await handler(params, context, event_queue)
 
-    # ----------------------------------------------------------------------
-    # PATTERNS — uncomment and adapt as needed.
-    # ----------------------------------------------------------------------
-    #
-    # Calling an LLM through the platform's LiteLLM gateway:
-    #
-    #     system_prompt = load_prompt("system_prompt.txt").format(input_data=input_data)
-    #     async with self.llm_client(context) as llm:
-    #         response = await llm.medium(system_prompt)
-    #     return {"status": "success", "summary": response.text}
-    #
-    # Dispatching when agent_card.json declares more than one skill:
-    #
-    #     handler = {
-    #         "skill_a": self._handle_a,
-    #         "skill_b": self._handle_b,
-    #     }.get(params.get("skill_id"))
-    #     if handler is None:
-    #         return {"status": "error", "error": f"Unknown skill: {params.get('skill_id')}"}
-    #     return await handler(params, context, event_queue)
-    #
-    # Persisting per-conversation state across turns (Redis-backed, with an
-    # in-memory fallback for local development):
-    #
-    #     state = self.load_context_state(str(context.context_id))
-    #     state["count"] = state.get("count", 0) + 1
-    #     self.save_context_state(str(context.context_id), state)
-    #
-    # See TUTORIAL.md ("Advanced topics") for emitting artifacts, asking the
-    # user for missing inputs (INPUT_REQUIRED), and DeepLynx file storage.
+    async def _plot_table(
+        self, params: dict[str, Any], context: RequestContext, event_queue: EventQueue
+    ) -> dict[str, Any]:
+        """Load CSV or JSON {columns, rows}, ask for axes, and publish a PNG."""
+        ctx = str(context.context_id)
+        state = self.load_context_state(ctx)
+        provided = self.get_provided_inputs(context)
+        # Retain the file and any chosen options while the user answers a form.
+        pending = state.get("pending_plot", {})
+        incoming_id = params.get("table_artifact_id")
+        if incoming_id and incoming_id != pending.get("table_artifact_id"):
+            pending = {}
+            state.pop("pending_plot", None)
+            self.save_context_state(ctx, state)
+        options = {**pending, **params, **provided}
+        table_id = _text(options.get("table_artifact_id"))
+        if not table_id:
+            return _error("table_artifact_id is required (a CSV or JSON table artifact).")
+        kind = options.get("kind") or "line"
+        if kind not in {"line", "scatter", "bar"}:
+            return _error("kind must be line, scatter, or bar.")
 
+        try:
+            path = await self.get_artifact_file_path(
+                table_id, context=context, artifacts=options.get("artifacts")
+            )
+            caption = ""
+            if path.suffix.lower() == ".json":
+                body = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(body, dict) or "columns" not in body or "rows" not in body:
+                    return _error("JSON table must contain 'columns' and 'rows'.")
+                frame = pd.DataFrame(body["rows"], columns=body["columns"])
+                caption = _text(body.get("caption"))
+            elif path.suffix.lower() == ".csv":
+                frame = pd.read_csv(path, encoding="utf-8-sig", dtype=str)
+            else:
+                return _error("Please provide a CSV file or a JSON table with columns and rows.")
+        except (OSError, ValueError, TypeError):
+            return _error("Could not read the table artifact. Check the file and artifact ID.")
+        if frame.empty:
+            return _error("The table has no data rows to plot.")
+        columns = list(frame.columns)
+        if (
+            any(not isinstance(c, str) or not c.strip() for c in columns)
+            or len(set(columns)) != len(columns)
+        ):
+            return _error("The table must have unique, non-empty text column names.")
+
+        missing = []
+        selected = {}
+        for key, label in (("x_column", "x axis"), ("y_column", "y axis")):
+            requested = _text(options.get(key))
+            if not requested:
+                missing.append(
+                    MissingInput(
+                        name=key,
+                        description=f"Column for the {label}",
+                        user_prompt=f"Which column goes on the {label}?",
+                        type="enum",
+                        options=columns,
+                    )
+                )
+                continue
+            # Exact names preserve meaningful case distinctions such as t/T.
+            matches = [c for c in columns if requested.casefold() in c.casefold()]
+            if requested in columns:
+                selected[key] = requested
+            elif len(matches) == 1:
+                selected[key] = matches[0]
+            else:
+                return _error(f"Cannot uniquely match '{requested}'. Available columns: {', '.join(columns)}.")
+        if missing:
+            state["pending_plot"] = options
+            self.save_context_state(ctx, state)
+            await self.send_input_required(
+                context, event_queue, missing_inputs=missing, hint="Choose the columns to plot."
+            )
+            return {}
+
+        x_col, y_col = selected["x_column"], selected["y_column"]
+        # Thousands separators and common missing markers occur in the practice data.
+        y = pd.to_numeric(frame[y_col].astype(str).str.replace(",", "", regex=False), errors="coerce")
+        y = y.replace([float("inf"), float("-inf")], float("nan"))
+        invalid = y.isna() & ~frame[y_col].fillna("").astype(str).str.strip().isin(
+            ["", "—", "–", "-", "NA", "N/A", "nan", "None"]
+        )
+        if invalid.any() or not y.notna().any():
+            return _error(f"Column '{y_col}' must contain numeric values. Available columns: {', '.join(columns)}.")
+        x_raw = frame[x_col].replace(["", "—", "–", "-", "NA", "N/A"], float("nan"))
+        x_numeric = pd.to_numeric(x_raw.astype(str).str.replace(",", "", regex=False), errors="coerce")
+        x = x_numeric if x_numeric.notna().sum() == x_raw.notna().sum() else x_raw
+        x = x.replace([float("inf"), float("-inf")], float("nan"))
+        valid = x.notna() & y.notna()
+        if not valid.any():
+            return _error("The selected columns have no rows with both x and y values.")
+
+        title = _text(options.get("title")) or caption or f"{y_col} vs {x_col}"
+        figure = Figure(figsize=(8, 5), layout="constrained")
+        FigureCanvasAgg(figure)
+        axes = figure.subplots()
+        getattr(axes, "plot" if kind == "line" else kind)(x[valid], y[valid])
+        axes.set(xlabel=x_col, ylabel=y_col, title=title)
+        axes.tick_params(axis="x", labelrotation=30)
+        try:
+            storage_config = ConnectionConfig.from_env()
+        except ValueError:
+            return _error("DeepLynx must be configured to publish plot images.")
+        with TemporaryDirectory(prefix="team5-plot-") as directory:
+            output = Path(directory) / "plot.png"
+            figure.savefig(output, format="png", dpi=150)
+            artifact = await self.send_deeplynx_artifact(
+                context,
+                event_queue,
+                file_path=output,
+                name="plot.png",
+                description=title,
+                storage_config=storage_config,
+                mime_type="image/png",
+            )
+        state.pop("pending_plot", None)
+        self.save_context_state(ctx, state)
+        return {
+            "status": "success",
+            "artifact_id": artifact.artifact_id,
+            "x_column": x_col,
+            "y_column": y_col,
+            "kind": kind,
+        }
 
 if __name__ == "__main__":
     agent = Team5TablePlotAgent(agent_name="Team-5 Table Plot Agent")

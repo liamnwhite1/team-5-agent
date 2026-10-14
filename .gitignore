@@ -1,2 +1,5 @@
 # Local secrets
 .env
+
+# Generated test plot previews
+/tests/output/

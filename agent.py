@@ -92,7 +92,14 @@ class Team5TablePlotAgent(PrometheusAgent):
             pending = {}
             state.pop("pending_plot", None)
             self.save_context_state(ctx, state)
-        options = {**pending, **params, **provided}
+        # Resumes replay the original call, which may still contain empty axes.
+        # Those empty placeholders must not erase answers from an earlier form.
+        options = dict(pending)
+        for values in (params, provided):
+            for key, value in values.items():
+                if key in {"table_artifact_id", "x_column", "y_column", "title", "kind"} and not _text(value):
+                    continue
+                options[key] = value
         table_id = _text(options.get("table_artifact_id"))
         if not table_id:
             return _error("table_artifact_id is required (a CSV or JSON table artifact).")

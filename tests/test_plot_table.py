@@ -179,3 +179,40 @@ async def test_bad_input_data(plot_agent, tmp_path, context, event_queue, conten
     assert result["status"] == "error"
     assert expected in result["error"]
     plot_agent.agent.send_deeplynx_artifact.assert_not_awaited()
+
+
+@pytest.mark.parametrize("partial", [False, True], ids=["complete-form", "partial-form"])
+async def test_real_form_answers_survive_replayed_call(
+    plot_agent, context, event_queue, monkeypatch, partial,
+):
+    """Use actual A2A data parts, as the orchestrator sends on resume."""
+    from a2a.types import Message, Part
+    from google.protobuf.json_format import ParseDict
+    from google.protobuf.struct_pb2 import Value
+
+    agent = plot_agent.agent
+    monkeypatch.setattr(
+        agent, "get_provided_inputs",
+        Team5TablePlotAgent.get_provided_inputs.__get__(agent),
+    )
+    context.message = Message()
+    params = {
+        "table_artifact_id": "mouse-table", "x_column": None, "y_column": "",
+    }
+    assert await agent._plot_table(params, context, event_queue) == {}
+
+    def answer(values):
+        context.message = Message(parts=[Part(data=ParseDict({"provided_inputs": values}, Value()))])
+
+    if partial:
+        answer({"x_column": "night"})
+        assert await agent._plot_table(params, context, event_queue) == {}
+        fields = agent.send_input_required.await_args.kwargs["missing_inputs"]
+        assert [field.name for field in fields] == ["y_column"]
+        answer({"y_column": "mice_sighted"})
+    else:
+        answer({"x_column": "night", "y_column": "mice_sighted"})
+
+    result = await agent._plot_table(params, context, event_queue)
+    assert result["status"] == "success"
+    assert agent.send_input_required.await_count == (2 if partial else 1)

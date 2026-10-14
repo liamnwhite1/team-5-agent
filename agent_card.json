@@ -56,11 +56,12 @@
           },
           "title": {
             "type": "string",
-            "description": "The title of the plot"
+            "description": "Optional plot title. Defaults to the selected y column vs the selected x column."
           },
           "kind": {
             "type": "string",
-            "enum": ["line", "scatter", "bar"]
+            "enum": ["line", "scatter", "bar"],
+            "description": "Chart type. Use bar for comparisons across text categories on the x axis. Defaults to line when omitted."
           }
         },
         "required": ["table_artifact_id"]

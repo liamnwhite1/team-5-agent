@@ -110,6 +110,7 @@ async def test_plot_data_and_png(plot_agent, context, event_queue, kind):
     assert axes.get_xlabel() == "night"
     assert axes.get_ylabel() == "mice_sighted"
     assert axes.get_title() == "Mouse sightings"
+    assert plot_agent.uploads[0]["description"] == "Mouse sightings"
     assert plot_agent.uploads[0]["mime_type"] == "image/png"
     assert not plot_agent.uploads[0]["file_path"].exists()  # Cleaned up after upload.
 
@@ -121,6 +122,81 @@ async def test_decimal_values_and_column_matching(plot_agent, context, event_que
     assert result["y_column"] == "tunnel_temperature_C"
     values = plot_agent.figures[0].axes[0].lines[0].get_ydata()
     assert list(values[:3]) == [4.1, 4.3, 4.0]
+
+
+@pytest.mark.parametrize("title", [None, "", "   "], ids=["omitted", "empty", "whitespace"])
+async def test_default_title_describes_selected_columns(
+    plot_agent, table_path, context, event_queue, title,
+):
+    params = {
+        "table_artifact_id": "mouse-table", "x_column": "night", "y_column": "temperature",
+    }
+    if title is not None:
+        params["title"] = title
+    result = await plot_agent.agent._plot_table(params, context, event_queue)
+
+    assert result["status"] == "success"
+    expected_title = "tunnel_temperature_C vs night"
+    assert plot_agent.figures[0].axes[0].get_title() == expected_title
+    upload = plot_agent.uploads[0]
+    assert upload["description"] == expected_title
+    assert upload["metadata"]["source_artifact_id"] == "mouse-table"
+    expected_caption = (
+        json.loads(table_path.read_text())["caption"] if table_path.suffix == ".json" else ""
+    )
+    assert upload["metadata"]["source_caption"] == expected_caption
+
+
+async def test_bar_chart_with_text_categories(plot_agent, table_path, context, event_queue):
+    agent = plot_agent.agent
+    agent.get_artifact_file_path.return_value = FIXTURES / f"cheese_inventory{table_path.suffix}"
+    result = await agent._plot_table({
+        "table_artifact_id": "inventory", "x_column": "cheese",
+        "y_column": "stock_kg", "kind": "bar",
+    }, context, event_queue)
+
+    assert result["status"] == "success"
+    assert result["kind"] == "bar"
+    axes = plot_agent.figures[0].axes[0]
+    assert [label.get_text() for label in axes.get_xticklabels()] == ["Gouda", "Brie", "Cheddar"]
+    assert [bar.get_height() for bar in axes.patches] == [1020, 650.5, 0]
+    assert axes.get_xlabel() == "cheese"
+    assert axes.get_ylabel() == "stock_kg"
+
+
+@pytest.mark.parametrize("case", ["repeated-label", "missing-categories"])
+async def test_category_bar_rows(
+    plot_agent, table_path, tmp_path, context, event_queue, case,
+):
+    # Repeated labels are separate observations, not an instruction to aggregate.
+    if case == "repeated-label":
+        rows = [["Gouda", 10], ["Brie", 20], ["Gouda", 30]]
+        labels, heights = ["Gouda", "Brie", "Gouda"], [10, 20, 30]
+    else:
+        rows = [[" Gouda ", 10], [None, 20], ["—", 30], ["  ", 40], ["Brie", 50]]
+        labels, heights = ["Gouda", "Brie"], [10, 50]
+
+    path = tmp_path / f"categories{table_path.suffix}"
+    columns = ["cheese", "stock_kg"]
+    if path.suffix == ".csv":
+        with path.open("w", newline="") as stream:
+            writer = csv.writer(stream)
+            writer.writerow(columns)
+            writer.writerows(rows)
+    else:
+        path.write_text(json.dumps({"caption": "Inventory", "columns": columns, "rows": rows}))
+    plot_agent.agent.get_artifact_file_path.return_value = path
+    result = await plot_agent.agent._plot_table({
+        "table_artifact_id": "categories", "x_column": "cheese",
+        "y_column": "stock_kg", "kind": "bar",
+    }, context, event_queue)
+
+    assert result["status"] == "success"
+    axes = plot_agent.figures[0].axes[0]
+    assert [label.get_text() for label in axes.get_xticklabels()] == labels
+    assert [bar.get_height() for bar in axes.patches] == heights
+    centers = [bar.get_x() + bar.get_width() / 2 for bar in axes.patches]
+    assert centers == list(range(len(labels)))
 
 
 async def test_missing_columns_form_and_resume(plot_agent, context, event_queue):

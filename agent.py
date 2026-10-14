@@ -173,19 +173,32 @@ class Team5TablePlotAgent(PrometheusAgent):
         )
         if invalid.any() or not y.notna().any():
             return _error(f"Column '{y_col}' must contain numeric values. Available columns: {', '.join(columns)}.")
-        x_raw = frame[x_col].replace(["", "—", "–", "-", "NA", "N/A"], float("nan"))
+        x_raw = frame[x_col].map(lambda value: value.strip() if isinstance(value, str) else value)
+        x_raw = x_raw.replace(["", "—", "–", "-", "NA", "N/A"], float("nan"))
         x_numeric = pd.to_numeric(x_raw.astype(str).str.replace(",", "", regex=False), errors="coerce")
-        x = x_numeric if x_numeric.notna().sum() == x_raw.notna().sum() else x_raw
+        numeric_x = x_numeric.notna().sum() == x_raw.notna().sum()
+        x = x_numeric if numeric_x else x_raw
         x = x.replace([float("inf"), float("-inf")], float("nan"))
         valid = x.notna() & y.notna()
         if not valid.any():
             return _error("The selected columns have no rows with both x and y values.")
 
-        title = _text(options.get("title")) or caption or f"{y_col} vs {x_col}"
+        title = _text(options.get("title")) or f"{y_col} vs {x_col}"
         figure = Figure(figsize=(8, 5), layout="constrained")
         FigureCanvasAgg(figure)
         axes = figure.subplots()
-        getattr(axes, "plot" if kind == "line" else kind)(x[valid], y[valid])
+        if kind == "bar" and not numeric_x:
+            # One position per row keeps repeated category names from overlapping.
+            labels = x[valid].astype(str).tolist()
+            positions = list(range(len(labels)))
+            axes.bar(positions, y[valid])
+            axes.set_xticks(positions, labels=labels)
+        elif kind == "bar":
+            axes.bar(x[valid], y[valid])
+        elif kind == "scatter":
+            axes.scatter(x[valid], y[valid])
+        else:
+            axes.plot(x[valid], y[valid])
         axes.set(xlabel=x_col, ylabel=y_col, title=title)
         axes.tick_params(axis="x", labelrotation=30)
         try:
@@ -203,6 +216,7 @@ class Team5TablePlotAgent(PrometheusAgent):
                 description=title,
                 storage_config=storage_config,
                 mime_type="image/png",
+                metadata={"source_artifact_id": table_id, "source_caption": caption},
             )
         state.pop("pending_plot", None)
         self.save_context_state(ctx, state)

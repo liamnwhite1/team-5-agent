@@ -59,6 +59,7 @@ services:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       AMSC_I2_API_KEY: ${AMSC_I2_API_KEY:-}
+      ASKSAGE_API_KEY: ${ASKSAGE_API_KEY:-}
 
       # Optional runtime tuning. Forwarded as empty when unset; prometheus_api
       # treats empty as "use the default", so the defaults are defined in one

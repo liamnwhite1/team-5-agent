@@ -5,6 +5,7 @@ description = "Extracts and publishes a table that can be plotted."
 requires-python = ">=3.12"
 dependencies = [
     "matplotlib>=3.9",
+    "markdown-it-py>=3.0",  # parses the tables in uploaded markdown
     "pandas>=2.2",
 ]
 

@@ -8,22 +8,40 @@
   },
   "skills": [
     {
-      "id": "team_5_table_plot_analysis",
+      "id": "team_5_plot_table",
       "name": "Team-5 Table Plot Analysis",
-      "description": "Performs analysis using team-5 table plot",
-      "usage_notes": "When to use this skill vs. other available skills.",
+      "description": "Plot columns of a table artifact or an uploaded CSV file as a png line, scatter, or bar chart. If the user name no columns, call it with only table_artifact_id: the skill asks, offering the real column names. Do not guess columns.",
+      "usage_notes": "Use for 'plot', 'chart', 'graph' requests on tabular data, including a CSV the user just uploaded. Column names may be approximate ('temperature').",
       "requires_approval": false,
-      "expected_duration_seconds": 30,
+      "expected_duration_seconds": 5,
       "output_format": "JSON with keys: status, input_received, message",
+      "tags": ["plot", "chart", "csv", "table"],
       "inputSchema": {
         "type": "object",
         "properties": {
-          "input_data": {
+          "table_artifact_id": {
             "type": "string",
-            "description": "The main input data to process."
+            "x_artifact_ref": "single",
+            "description": "The artifact ID of the data to plot (a csv)"
+          },
+          "x_column": {
+            "type": "string",
+            "description": "The name of the x axis, or the name of the column (approximate ok)"
+          },
+          "y_column": {
+            "type": "string",
+            "description": "Column(s) for the y axis (approximate ok)"
+          },
+          "title": {
+            "type": "string",
+            "description": "The title of the plot"
+          },
+          "kind": {
+            "type": "string",
+            "enum": ["line", "scatter", "bar"]
           }
         },
-        "required": ["input_data"]
+        "required": ["table_artifact_id"]
       }
     }
   ]

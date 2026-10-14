@@ -432,6 +432,8 @@ class Team5TablePlotAgent(PrometheusAgent):
         options = dict(pending)
         for values in (params, provided):
             for key, value in values.items():
+                if key == "y_columns" and (value is None or value == []):
+                    continue
                 if key in {
                     "table_artifact_id", "x_column", "y_column", "title", "kind", "x_scale", "y_scale",
                 } and (value is None or isinstance(value, str) and not value.strip()):
@@ -481,16 +483,23 @@ class Team5TablePlotAgent(PrometheusAgent):
         ):
             return _error("The table must have unique, non-empty text column names.")
 
+        requested_y = options.get("y_columns")
+        if requested_y is None:
+            requested_y = [_text(options["y_column"])] if _text(options.get("y_column")) else []
+        if not isinstance(requested_y, list) or any(not _text(name) for name in requested_y):
+            return _error("y_columns must be an array of non-empty column names.")
         missing = []
-        selected = {}
-        for key, label in (("x_column", "x axis"), ("y_column", "y axis")):
-            requested = _text(options.get(key))
+        selected = {"y_columns": []}
+        requests = [("x_column", _text(options.get("x_column")))]
+        requests += [("y_column", name.strip()) for name in requested_y] or [("y_column", "")]
+        for key, requested in requests:
             if not requested:
+                axis = "x" if key == "x_column" else "y"
                 missing.append(
                     MissingInput(
                         name=key,
-                        description=f"Column for the {label}",
-                        user_prompt=f"Which column goes on the {label}?",
+                        description=f"Column for the {axis} axis",
+                        user_prompt=f"Which column goes on the {axis} axis?",
                         type="enum",
                         options=columns,
                     )
@@ -499,11 +508,17 @@ class Team5TablePlotAgent(PrometheusAgent):
             # Exact names preserve meaningful case distinctions such as t/T.
             matches = [c for c in columns if requested.casefold() in c.casefold()]
             if requested in columns:
-                selected[key] = requested
+                matched = requested
             elif len(matches) == 1:
-                selected[key] = matches[0]
+                matched = matches[0]
             else:
                 return _error(f"Cannot uniquely match '{requested}'. Available columns: {', '.join(columns)}.")
+            if key == "x_column":
+                selected[key] = matched
+            elif matched in selected["y_columns"]:
+                return _error(f"Y column '{matched}' was selected more than once. Choose distinct columns.")
+            else:
+                selected["y_columns"].append(matched)
         if missing:
             state["pending_plot"] = options
             self.save_context_state(ctx, state)
@@ -512,52 +527,75 @@ class Team5TablePlotAgent(PrometheusAgent):
             )
             return {}
 
-        x_col, y_col = selected["x_column"], selected["y_column"]
-        # Thousands separators and common missing markers occur in the practice data.
-        y = pd.to_numeric(frame[y_col].astype(str).str.replace(",", "", regex=False), errors="coerce")
-        y = y.replace([float("inf"), float("-inf")], float("nan"))
-        invalid = y.isna() & ~frame[y_col].fillna("").astype(str).str.strip().isin(
-            ["", "—", "–", "-", "NA", "N/A", "nan", "None"]
-        )
-        if invalid.any() or not y.notna().any():
-            return _error(f"Column '{y_col}' must contain numeric values. Available columns: {', '.join(columns)}.")
+        x_col, y_cols = selected["x_column"], selected["y_columns"]
+        series = {}
+        for y_col in y_cols:
+            # Thousands separators and common missing markers occur in the practice data.
+            y = pd.to_numeric(frame[y_col].astype(str).str.replace(",", "", regex=False), errors="coerce")
+            y = y.replace([float("inf"), float("-inf")], float("nan"))
+            invalid = y.isna() & ~frame[y_col].fillna("").astype(str).str.strip().isin(MISSING_MARKERS)
+            if invalid.any() or not y.notna().any():
+                return _error(f"Column '{y_col}' must contain numeric values. Available columns: {', '.join(columns)}.")
+            series[y_col] = y
         x_raw = frame[x_col].map(lambda value: value.strip() if isinstance(value, str) else value)
         x_raw = x_raw.replace(["", "—", "–", "-", "NA", "N/A"], float("nan"))
         x_numeric = pd.to_numeric(x_raw.astype(str).str.replace(",", "", regex=False), errors="coerce")
         numeric_x = x_numeric.notna().sum() == x_raw.notna().sum()
         x = x_numeric if numeric_x else x_raw
         x = x.replace([float("inf"), float("-inf")], float("nan"))
-        valid = x.notna() & y.notna()
-        if not valid.any():
-            return _error("The selected columns have no rows with both x and y values.")
         if x_scale == "log" and not numeric_x:
             return _error(f"Column '{x_col}' must be numeric for a logarithmic x axis.")
-        for column, values, scale in ((x_col, x, x_scale), (y_col, y, y_scale)):
-            if scale == "log" and (values[valid] <= 0).any():
-                return _error(
-                    f"Column '{column}' contains zero or negative values. "
-                    "A logarithmic axis requires strictly positive values; use a linear scale instead."
-                )
+        masks = {}
+        for y_col, y in series.items():
+            valid = x.notna() & y.notna()
+            if not valid.any():
+                return _error(f"The selected columns '{x_col}' and '{y_col}' have no rows with both x and y values.")
+            masks[y_col] = valid
+            for column, values, scale in ((x_col, x, x_scale), (y_col, y, y_scale)):
+                if scale == "log" and (values[valid] <= 0).any():
+                    return _error(
+                        f"Column '{column}' contains zero or negative values. "
+                        "A logarithmic axis requires strictly positive values; use a linear scale instead."
+                    )
 
-        x_label, y_label = _column_label(x_col), _column_label(y_col)
-        title = _text(options.get("title")) or f"{y_label} vs {x_label}"
+        x_label = _column_label(x_col)
+        y_labels = [_column_label(column) for column in y_cols]
+        title = _text(options.get("title")) or f"{', '.join(y_labels)} vs {x_label}"
         figure = Figure(figsize=(8, 5), layout="constrained")
         FigureCanvasAgg(figure)
         axes = figure.subplots()
         # Set scales before categorical ticks; changing scales resets tick locators.
         axes.set(xscale=x_scale, yscale=y_scale)
-        if kind == "bar" and not numeric_x:
-            # One position per row keeps repeated category names from overlapping.
-            labels = x[valid].astype(str).tolist()
-            positions = list(range(len(labels)))
-            axes.bar(positions, y[valid])
-            axes.set_xticks(positions, labels=labels)
-        elif kind == "bar":
-            axes.bar(x[valid], y[valid])
-        elif kind == "scatter":
-            axes.scatter(x[valid], y[valid])
-        else:
-            axes.plot(x[valid], y[valid])
+        if kind == "bar":
+            bar_rows = pd.DataFrame(masks).any(axis=1)
+            if not numeric_x:
+                # Share category positions across series, even when one has missing data.
+                positions = pd.Series(float("nan"), index=frame.index)
+                positions.loc[bar_rows] = range(int(bar_rows.sum()))
+                axes.set_xticks(positions[bar_rows], labels=x[bar_rows].astype(str).tolist())
+                group_width = 0.8
+            else:
+                positions = x
+                distinct = sorted(x[bar_rows].unique())
+                spacing = min((b - a for a, b in zip(distinct, distinct[1:])), default=1)
+                if x_scale == "log":
+                    spacing = min(spacing, min(distinct))
+                group_width = 0.8 if len(series) == 1 else 0.8 * spacing
+            width = group_width / len(series)
+        for index, (y_col, y) in enumerate(series.items()):
+            valid = masks[y_col]
+            label = _column_label(y_col)
+            if kind == "bar":
+                offset = (index - (len(series) - 1) / 2) * width
+                axes.bar(positions[valid] + offset, y[valid], width=width, label=label)
+            elif kind == "scatter":
+                axes.scatter(x[valid], y[valid], label=label)
+            else:
+                # Keep missing y values as gaps instead of connecting across missing data.
+                axes.plot(x[x.notna()], y[x.notna()], label=label)
+        if len(series) > 1:
+            axes.legend()
+        y_label = y_labels[0] if len(series) == 1 else "Value (units shown in legend)"
         axes.set(xlabel=x_label, ylabel=y_label, title=title)
         axes.tick_params(axis="x", labelrotation=30)
         try:
@@ -583,7 +621,8 @@ class Team5TablePlotAgent(PrometheusAgent):
             "status": "success",
             "artifact_id": artifact.artifact_id,
             "x_column": x_col,
-            "y_column": y_col,
+            "y_column": y_cols[0] if len(y_cols) == 1 else None,
+            "y_columns": y_cols,
             "kind": kind,
             "x_scale": x_scale,
             "y_scale": y_scale,

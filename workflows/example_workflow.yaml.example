@@ -1,0 +1,30 @@
+id: team-5-table-plot.example_workflow
+name: Team-5 Table Plot Example Workflow
+version: "1.0.0"
+description: Example agent-owned workflow for Team-5 Table Plot. Rename this file to .yaml to publish it.
+inputs:
+  required:
+    - input_data
+  optional: []
+execution:
+  mode: sequential
+  max_concurrency: 1
+  on_error: fail_fast
+steps:
+  - id: run_primary_skill
+    skill_id: team_5_table_plot_analysis
+    is_final: true
+    params:
+      input_data:
+        from: input.input_data
+outputs:
+  final:
+    from: step.run_primary_skill.result
+metadata:
+  requires_approval: false
+  estimated_duration_seconds: 30
+  owner: team-5-table-plot
+ui:
+  category: Team-5 Table Plot
+  display_name: Team-5 Table Plot Example Workflow
+  summary: Example workflow that invokes the primary Team-5 Table Plot skill.

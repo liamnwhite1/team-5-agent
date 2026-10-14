@@ -149,6 +149,7 @@ async def test_plot_data_and_png(plot_agent, context, event_queue, kind):
     assert result == {
         "status": "success", "artifact_id": "plot-result",
         "x_column": "night", "y_column": "mice_sighted", "kind": kind,
+        "x_scale": "linear", "y_scale": "linear",
     }
     agent.get_artifact_file_path.assert_awaited_once_with(
         "mouse-table", context=context, artifacts=None,
@@ -166,6 +167,8 @@ async def test_plot_data_and_png(plot_agent, context, event_queue, kind):
     assert axes.get_xlabel() == "Night"
     assert axes.get_ylabel() == "Mice sighted"
     assert axes.get_title() == "Mouse sightings"
+    assert axes.get_xscale() == "linear"
+    assert axes.get_yscale() == "linear"
     assert plot_agent.uploads[0]["description"] == "Mouse sightings"
     assert plot_agent.uploads[0]["mime_type"] == "image/png"
     assert not plot_agent.uploads[0]["file_path"].exists()  # Cleaned up after upload.
@@ -221,8 +224,9 @@ async def test_bar_chart_with_text_categories(plot_agent, table_path, context, e
 
 
 @pytest.mark.parametrize("case", ["repeated-label", "missing-categories"])
+@pytest.mark.parametrize("y_scale", ["linear", "log"])
 async def test_category_bar_rows(
-    plot_agent, table_path, tmp_path, context, event_queue, case,
+    plot_agent, table_path, tmp_path, context, event_queue, case, y_scale,
 ):
     # Repeated labels are separate observations, not an instruction to aggregate.
     if case == "repeated-label":
@@ -244,11 +248,12 @@ async def test_category_bar_rows(
     plot_agent.agent.get_artifact_file_path.return_value = path
     result = await plot_agent.agent._plot_table({
         "table_artifact_id": "categories", "x_column": "cheese",
-        "y_column": "stock_kg", "kind": "bar",
+        "y_column": "stock_kg", "kind": "bar", "y_scale": y_scale,
     }, context, event_queue)
 
     assert result["status"] == "success"
     axes = plot_agent.figures[0].axes[0]
+    assert axes.get_yscale() == y_scale
     assert [label.get_text() for label in axes.get_xticklabels()] == labels
     assert [bar.get_height() for bar in axes.patches] == heights
     centers = [bar.get_x() + bar.get_width() / 2 for bar in axes.patches]
@@ -348,3 +353,91 @@ async def test_real_form_answers_survive_replayed_call(
     result = await agent._plot_table(params, context, event_queue)
     assert result["status"] == "success"
     assert agent.send_input_required.await_count == (2 if partial else 1)
+
+
+@pytest.mark.parametrize("kind", ["line", "scatter", "bar"])
+@pytest.mark.parametrize("x_scale,y_scale", [("log", "linear"), ("linear", "log"), ("log", "log")])
+async def test_log_scales(plot_agent, context, event_queue, kind, x_scale, y_scale):
+    result = await plot_agent.agent._plot_table({
+        "table_artifact_id": "mouse-table", "x_column": "night", "y_column": "mice_sighted",
+        "kind": kind, "x_scale": x_scale, "y_scale": y_scale,
+    }, context, event_queue)
+    assert result["status"] == "success"
+    assert result["x_scale"] == x_scale
+    assert result["y_scale"] == y_scale
+    axes = plot_agent.figures[0].axes[0]
+    assert axes.get_xscale() == x_scale
+    assert axes.get_yscale() == y_scale
+    assert plot_agent.uploads  # Mock also validates and saves a real PNG.
+
+
+@pytest.mark.parametrize("scale_key", ["x_scale", "y_scale"])
+@pytest.mark.parametrize("value", ["symlog", 3])
+async def test_invalid_scale(plot_agent, context, event_queue, scale_key, value):
+    result = await plot_agent.agent._plot_table({
+        "table_artifact_id": "mouse-table", "x_column": "night", "y_column": "mice_sighted",
+        scale_key: value,
+    }, context, event_queue)
+    assert result["status"] == "error"
+    assert f"{scale_key} must be linear or log" in result["error"]
+    plot_agent.agent.send_deeplynx_artifact.assert_not_awaited()
+
+
+@pytest.mark.parametrize("scale_key", ["x_scale", "y_scale"])
+@pytest.mark.parametrize("bad_value", [0, -1])
+async def test_log_scale_rejects_nonpositive_values(
+    plot_agent, table_path, tmp_path, context, event_queue, scale_key, bad_value,
+):
+    path = tmp_path / f"nonpositive{table_path.suffix}"
+    columns = ["x", "y"]
+    rows = [[1, 10], [bad_value, 20]] if scale_key == "x_scale" else [[1, 10], [2, bad_value]]
+    if path.suffix == ".csv":
+        with path.open("w", newline="") as stream:
+            writer = csv.writer(stream)
+            writer.writerow(columns)
+            writer.writerows(rows)
+    else:
+        path.write_text(json.dumps({"columns": columns, "rows": rows}))
+    plot_agent.agent.get_artifact_file_path.return_value = path
+    result = await plot_agent.agent._plot_table({
+        "table_artifact_id": "nonpositive", "x_column": "x", "y_column": "y", scale_key: "log",
+    }, context, event_queue)
+    assert result["status"] == "error"
+    assert "strictly positive" in result["error"]
+    assert "linear scale" in result["error"]
+    plot_agent.agent.send_deeplynx_artifact.assert_not_awaited()
+
+
+async def test_log_x_rejects_text_categories(plot_agent, table_path, context, event_queue):
+    plot_agent.agent.get_artifact_file_path.return_value = FIXTURES / f"cheese_inventory{table_path.suffix}"
+    result = await plot_agent.agent._plot_table({
+        "table_artifact_id": "inventory", "x_column": "cheese", "y_column": "stock_kg",
+        "kind": "bar", "x_scale": "log",
+    }, context, event_queue)
+    assert result["status"] == "error"
+    assert "numeric" in result["error"]
+    plot_agent.agent.send_deeplynx_artifact.assert_not_awaited()
+
+
+async def test_log_y_rejects_zero_height_bars(plot_agent, table_path, context, event_queue):
+    plot_agent.agent.get_artifact_file_path.return_value = FIXTURES / f"cheese_inventory{table_path.suffix}"
+    # This fixture includes a real zero; reject it rather than silently hide that bar.
+    result = await plot_agent.agent._plot_table({
+        "table_artifact_id": "inventory", "x_column": "cheese", "y_column": "stock_kg",
+        "kind": "bar", "y_scale": "log",
+    }, context, event_queue)
+    assert result["status"] == "error"
+    assert "strictly positive" in result["error"]
+    plot_agent.agent.send_deeplynx_artifact.assert_not_awaited()
+
+
+async def test_scale_survives_column_form(plot_agent, context, event_queue):
+    agent = plot_agent.agent
+    assert await agent._plot_table({
+        "table_artifact_id": "mouse-table", "y_scale": "log",
+    }, context, event_queue) == {}
+    agent.get_provided_inputs.return_value = {"x_column": "night", "y_column": "mice_sighted"}
+    result = await agent._plot_table({"y_scale": None}, context, event_queue)
+    assert result["status"] == "success"
+    assert result["y_scale"] == "log"
+    assert plot_agent.figures[0].axes[0].get_yscale() == "log"

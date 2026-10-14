@@ -44,7 +44,7 @@
       "usage_notes": "Use for 'plot', 'chart', 'graph' requests on tabular data. For a table inside a markdown document, call team_5_extract_table first and pass its table_artifact_id here. Not for markdown documents directly. Column names may be approximate ('temperature').",
       "requires_approval": false,
       "expected_duration_seconds": 5,
-      "output_format": "JSON with keys: status, artifact_id, x_column, y_column, kind",
+      "output_format": "JSON with keys: status, artifact_id, x_column, y_column, kind, x_scale, y_scale",
       "tags": [
         "plot",
         "chart",
@@ -70,6 +70,16 @@
           "title": {
             "type": "string",
             "description": "Optional plot title. Defaults to readable selected column labels with units, in y vs x order. The source caption is preserved in artifact metadata."
+          },
+          "x_scale": {
+            "type": "string",
+            "enum": ["linear", "log"],
+            "description": "X axis scale; defaults to linear. Use log only when requested, with numeric, strictly positive x values."
+          },
+          "y_scale": {
+            "type": "string",
+            "enum": ["linear", "log"],
+            "description": "Y axis scale; defaults to linear. Use log for a requested logarithmic y axis with strictly positive values. For a log-log plot set both scales to log."
           },
           "kind": {
             "type": "string",

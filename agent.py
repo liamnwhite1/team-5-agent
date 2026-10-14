@@ -108,33 +108,65 @@ def _caption(paragraph) -> str:
     return _plain_text(children)
 
 
+def _cells_as_written(line: str) -> int:
+    """How many cells a table row has in the source, before the parser pads or cuts it.
+
+    Cells are split on pipes, except escaped ones (\\|) and the optional outer pipes.
+    """
+    text = line.strip()
+    if text.startswith("|"):
+        text = text[1:]
+    if text.endswith("|") and not text.endswith("\\|"):
+        text = text[:-1]
+    return len(re.split(r"(?<!\\)\|", text))
+
+
 def find_tables(markdown: str) -> list[dict[str, Any]]:
     """Every table in a markdown document, with the caption written above it.
 
     Each table is a dict with its caption, section (the heading it sits under),
     columns and rows. Cells keep the text as written in the document.
+
+    The markdown rules quietly pad a short row, cut a long one, and end a
+    table at a blank line, which would hand back wrong numbers without any
+    error. Those cases are recorded in the table's "problem" instead.
     """
+    lines = markdown.splitlines()
     tokens = MarkdownIt("commonmark").enable("table").parse(markdown)
     tables: list[dict[str, Any]] = []
     section = caption = ""
-    row = None
+    row = row_line = None
     for i, token in enumerate(tokens):
         if token.type == "table_open":
-            tables.append({"caption": caption, "section": section, "columns": [], "rows": []})
+            tables.append(
+                {"caption": caption, "section": section, "columns": [], "rows": [], "problem": ""}
+            )
         elif token.type == "tr_open":
-            row = []
+            row, row_line = [], token.map[0]
         elif token.type == "inline" and row is not None:  # one table cell
             row.append(_plain_text(token.children or []))
         elif token.type == "tr_close":
             table = tables[-1]
-            if table["columns"]:
-                table["rows"].append(row)
-            else:
+            if not table["columns"]:
                 table["columns"] = row
+            else:
+                table["rows"].append(row)
+                written = _cells_as_written(lines[row_line])
+                if written != len(table["columns"]) and not table["problem"]:
+                    table["problem"] = (
+                        f"row {len(table['rows'])} (line {row_line + 1}) has {written} cells "
+                        f"but the header has {len(table['columns'])}"
+                    )
             row = None
         elif token.level == 0 and token.type == "heading_open":
             section = caption = _plain_text(tokens[i + 1].children or [])
         elif token.level == 0 and token.type == "paragraph_open":
+            first_line = lines[token.map[0]].lstrip()
+            if tokens[i - 1].type == "table_close" and first_line.startswith("|"):
+                tables[-1]["problem"] = tables[-1]["problem"] or (
+                    f"a blank line at line {token.map[0]} cuts it short, so the rows "
+                    "after it are not part of the table"
+                )
             caption = _caption(tokens[i + 1])
         if token.level == 0 and token.type in CAPTION_BREAKERS:
             caption = ""  # a caption belongs only to the table right below it
@@ -261,6 +293,11 @@ class Team5TablePlotAgent(PrometheusAgent):
 
         table = tables[index]
         caption = table["caption"]
+        if table["problem"]:
+            return _error(
+                f"The table '{caption or f'table {index + 1}'}' in '{source}' is not well-formed "
+                f"markdown: {table['problem']}. Fix the table and upload the document again."
+            )
         columns = _unique_names(table["columns"])
         rows = [[_clean_cell(cell) for cell in row] for row in table["rows"]]
         artifact_id = await self.send_json_artifact(

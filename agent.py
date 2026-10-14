@@ -10,19 +10,30 @@
 #
 # SPDX-License-Identifier: MIT
 
-"""Team-5 agent for extracting tables and plotting tabular artifacts."""
+"""Team-5 agent for extracting tables and plotting tabular artifacts.
+
+Extracting a table: markdown-it-py finds every table in the document together
+with the caption written above it, and the small LLM picks the one the user
+described. Plotting: see ``_plot_table``.
+"""
 
 import json
 import logging
+import math
+import os
+import re
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 
 import pandas as pd
+from markdown_it import MarkdownIt
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 from prometheus_api.agent import EventQueue, MissingInput, PrometheusAgent, RequestContext
+from prometheus_api.llm_client import LLMConfig, ToolDefinition, acall_tool
 from prometheus_api.storage_client.connection import ConnectionConfig
+from pydantic import BaseModel, Field
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,6 +42,36 @@ logging.basicConfig(
 
 EXTRACT_SKILL = "team_5_extract_table"
 PLOT_SKILL = "team_5_plot_table"
+
+# Uploads the extract skill can read as markdown.
+MARKDOWN_SUFFIXES = {".md", ".markdown", ".txt"}
+# Cell text that means "no value".
+MISSING_MARKERS = {"", "—", "–", "-", "NA", "N/A", "nan", "None"}
+# Block types that separate a caption from the table below it.
+CAPTION_BREAKERS = {
+    "table_close", "bullet_list_open", "ordered_list_open", "blockquote_open",
+    "fence", "code_block", "hr", "html_block",
+}
+
+PICK_TABLE_PROMPT = """\
+A user wants one table from a document. They described it as: "{description}"
+
+The tables in the document, by index:
+{listing}
+
+Call pick_table with the index of the table the user means. Match on meaning, \
+not exact wording. If no table fits the description, use -1."""
+
+
+class TablePick(BaseModel):
+    index: int = Field(description="Index of the table the user means, or -1 if none fits.")
+    reason: str = Field(description="One short sentence explaining the choice.")
+
+
+PICK_TABLE_TOOL = ToolDefinition.from_pydantic(
+    "pick_table", TablePick, description="Choose the table the user described."
+)
+
 
 def _text(value: Any) -> str:
     return value.strip() if isinstance(value, str) else ""
@@ -43,6 +84,102 @@ def _error(message: str) -> dict[str, Any]:
     needs to correct the call (real captions, real column names) goes in there.
     """
     return {"status": "error", "error": message}
+
+
+def _plain_text(tokens: list) -> str:
+    """The visible text of inline markdown tokens, without formatting marks."""
+    parts = [
+        token.content if token.type in ("text", "code_inline") else " "
+        for token in tokens
+        if token.type in ("text", "code_inline", "softbreak", "hardbreak")
+    ]
+    return " ".join("".join(parts).split())
+
+
+def _caption(paragraph) -> str:
+    """The bold text a paragraph starts with, or the whole paragraph if not bold.
+
+    Captions look like "**Table 2. Census of ...** An optional note."
+    """
+    children = [token for token in paragraph.children or [] if token.content or token.type != "text"]
+    if children and children[0].type == "strong_open":
+        end = next(i for i, token in enumerate(children) if token.type == "strong_close")
+        return _plain_text(children[1:end])
+    return _plain_text(children)
+
+
+def find_tables(markdown: str) -> list[dict[str, Any]]:
+    """Every table in a markdown document, with the caption written above it.
+
+    Each table is a dict with its caption, section (the heading it sits under),
+    columns and rows. Cells keep the text as written in the document.
+    """
+    tokens = MarkdownIt("commonmark").enable("table").parse(markdown)
+    tables: list[dict[str, Any]] = []
+    section = caption = ""
+    row = None
+    for i, token in enumerate(tokens):
+        if token.type == "table_open":
+            tables.append({"caption": caption, "section": section, "columns": [], "rows": []})
+        elif token.type == "tr_open":
+            row = []
+        elif token.type == "inline" and row is not None:  # one table cell
+            row.append(_plain_text(token.children or []))
+        elif token.type == "tr_close":
+            table = tables[-1]
+            if table["columns"]:
+                table["rows"].append(row)
+            else:
+                table["columns"] = row
+            row = None
+        elif token.level == 0 and token.type == "heading_open":
+            section = caption = _plain_text(tokens[i + 1].children or [])
+        elif token.level == 0 and token.type == "paragraph_open":
+            caption = _caption(tokens[i + 1])
+        if token.level == 0 and token.type in CAPTION_BREAKERS:
+            caption = ""  # a caption belongs only to the table right below it
+    return tables
+
+
+def _unique_names(names: list[str]) -> list[str]:
+    """Name blank headers and number repeated ones: the plotter needs unique names."""
+    unique: list[str] = []
+    for position, name in enumerate(names, start=1):
+        name = name or f"Column {position}"
+        candidate, count = name, 2
+        while candidate in unique:
+            candidate, count = f"{name} ({count})", count + 1
+        unique.append(candidate)
+    return unique
+
+
+def _clean_cell(text: str) -> int | float | str | None:
+    """'1,020' -> 1020 and '—' -> None. Text that is not a number stays as it is."""
+    if text in MISSING_MARKERS:
+        return None
+    try:
+        number = float(text.replace(",", ""))
+    except ValueError:
+        return text
+    if not math.isfinite(number):
+        return text
+    return int(number) if number.is_integer() and "." not in text else number
+
+
+def _numeric_columns(columns: list[str], rows: list[list[Any]]) -> list[str]:
+    """Columns whose values are all numbers or missing, with at least one number."""
+    numeric = []
+    for i, column in enumerate(columns):
+        values = [row[i] for row in rows if row[i] is not None]
+        if values and all(isinstance(value, (int, float)) for value in values):
+            numeric.append(column)
+    return numeric
+
+
+def _artifact_name(caption: str, position: int) -> str:
+    """A short name with no file extension, so the plotter reads the table as JSON."""
+    slug = re.sub(r"[^a-z0-9]+", "_", caption.lower()).strip("_")[:50].rstrip("_")
+    return slug or f"table_{position}"
 
 
 class Team5TablePlotAgent(PrometheusAgent):
@@ -77,6 +214,103 @@ class Team5TablePlotAgent(PrometheusAgent):
             return _error(f"Skill '{skill_id}' is not implemented yet.")
 
         return await handler(params, context, event_queue)
+
+    async def _extract_table(
+        self, params: dict[str, Any], context: RequestContext, event_queue: EventQueue
+    ) -> dict[str, Any]:
+        """Find the table the user described in a markdown document and publish it as JSON."""
+        document_id = _text(params.get("document_artifact_id"))
+        description = _text(params.get("table_description"))
+        if not document_id:
+            return _error("document_artifact_id is required (the uploaded markdown document).")
+        if not description:
+            return _error("table_description is required: how the user referred to the table.")
+
+        try:
+            path = await self.get_artifact_file_path(
+                document_id, context=context, artifacts=params.get("artifacts")
+            )
+        except FileNotFoundError:
+            return _error(f"Artifact '{document_id}' was not found in this conversation.")
+        reference = self.resolve_artifact_reference(str(context.context_id), document_id)
+        source = reference.name if reference else path.name
+        if path.suffix.lower() not in MARKDOWN_SUFFIXES:
+            return _error(
+                f"'{source}' is not a markdown document. "
+                f"A CSV file can be plotted directly with {PLOT_SKILL}."
+            )
+        try:
+            tables = [table for table in find_tables(path.read_text(encoding="utf-8")) if table["rows"]]
+        except UnicodeDecodeError:
+            return _error(f"'{source}' is not a readable text file.")
+        if not tables:
+            return _error(f"No tables were found in '{source}'.")
+
+        await self.send_status_update(
+            context,
+            event_queue,
+            message=f"Found {len(tables)} table(s); asking which one matches '{description}'.",
+        )
+        index, reason = await self._pick_table(context, description, tables)
+        if index < 0:
+            captions = "; ".join(
+                table["caption"] or f"table {position} (no caption)"
+                for position, table in enumerate(tables, start=1)
+            )
+            return _error(f"No table in '{source}' matches '{description}'. Its tables are: {captions}")
+
+        table = tables[index]
+        caption = table["caption"]
+        columns = _unique_names(table["columns"])
+        rows = [[_clean_cell(cell) for cell in row] for row in table["rows"]]
+        artifact_id = await self.send_json_artifact(
+            context,
+            event_queue,
+            {"caption": caption, "columns": columns, "rows": rows},
+            name=_artifact_name(caption, index + 1),
+            description=caption or f"Table {index + 1} of {source}",
+            catalog_artifact=True,
+        )
+        return {
+            "status": "success",
+            "table_artifact_id": artifact_id,
+            "caption": caption,
+            "columns": columns,
+            "numeric_columns": _numeric_columns(columns, rows),
+            "row_count": len(rows),
+            "why_this_table": reason,
+        }
+
+    async def _pick_table(
+        self, context: RequestContext, description: str, tables: list[dict[str, Any]]
+    ) -> tuple[int, str]:
+        """Ask the small LLM which table the description means.
+
+        Returns (index, reason), with index -1 when no table fits. If the LLM
+        cannot be reached the error is left to raise: that is infrastructure,
+        not something the user can fix.
+        """
+        listing = "\n".join(
+            f"[{i}] Section: {table['section'] or '-'} | "
+            f"Caption: {table['caption'][:300] or '(none)'} | "
+            f"Columns: {', '.join(table['columns'])}"
+            for i, table in enumerate(tables)
+        )
+        config = LLMConfig.from_env()
+        if config.proxy_url:  # only the platform's own LiteLLM proxy needs the master key
+            config = config.with_api_key(os.getenv("LITELLM_MASTER_KEY"))
+        async with self.llm_client(context, config=config) as llm:
+            call = await acall_tool(
+                llm,
+                PICK_TABLE_PROMPT.format(description=description, listing=listing),
+                tool=PICK_TABLE_TOOL,
+                model="small",
+                max_tokens=400,
+            )
+        index = call.arguments.get("index")
+        if type(index) is not int or not 0 <= index < len(tables):
+            index = -1  # "none fits", or an answer that names no real table
+        return index, _text(call.arguments.get("reason"))
 
     async def _plot_table(
         self, params: dict[str, Any], context: RequestContext, event_queue: EventQueue

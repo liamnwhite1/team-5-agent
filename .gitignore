@@ -3,3 +3,6 @@
 
 # Generated test plot previews
 /tests/output/
+
+# Python bytecode caches
+__pycache__/

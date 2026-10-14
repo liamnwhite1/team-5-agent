@@ -149,6 +149,7 @@ async def test_plot_data_and_png(plot_agent, context, event_queue, kind):
     assert result == {
         "status": "success", "artifact_id": "plot-result",
         "x_column": "night", "y_column": "mice_sighted", "kind": kind,
+        "y_columns": ["mice_sighted"],
         "x_scale": "linear", "y_scale": "linear",
     }
     agent.get_artifact_file_path.assert_awaited_once_with(
@@ -518,3 +519,154 @@ async def test_scale_survives_column_form(plot_agent, context, event_queue):
     assert result["status"] == "success"
     assert result["y_scale"] == "log"
     assert plot_agent.figures[0].axes[0].get_yscale() == "log"
+
+
+@pytest.mark.parametrize("kind", ["line", "scatter", "bar"])
+@pytest.mark.parametrize("y_scale", ["linear", "log"])
+async def test_multiple_y_series(plot_agent, context, event_queue, kind, y_scale):
+    result = await plot_agent.agent._plot_table({
+        "table_artifact_id": "mouse-table", "x_column": "night",
+        "y_columns": ["traps_set", "sprung"], "kind": kind, "y_scale": y_scale,
+    }, context, event_queue)
+    assert result["status"] == "success"
+    assert result["y_columns"] == ["traps_set", "traps_sprung"]
+    assert result["y_column"] is None
+    axes = plot_agent.figures[0].axes[0]
+    assert len(plot_agent.figures[0].axes) == 1
+    assert [text.get_text() for text in axes.get_legend().get_texts()] == ["Traps set", "Traps sprung"]
+    assert axes.get_yscale() == y_scale
+    assert axes.get_title() == "Traps set, Traps sprung vs Night"
+    if kind == "line":
+        assert len(axes.lines) == 2
+        assert list(axes.lines[0].get_ydata()[:3]) == [20, 20, 25]
+        assert list(axes.lines[1].get_ydata()[:3]) == [6, 9, 11]
+    elif kind == "scatter":
+        assert len(axes.collections) == 2
+        assert axes.collections[0].get_offsets()[:3].tolist() == [[1, 20], [2, 20], [3, 25]]
+        assert axes.collections[1].get_offsets()[:3].tolist() == [[1, 6], [2, 9], [3, 11]]
+    else:
+        assert len(axes.containers) == 2
+        assert [bar.get_height() for bar in axes.containers[0]][:3] == [20, 20, 25]
+        assert [bar.get_height() for bar in axes.containers[1]][:3] == [6, 9, 11]
+        left, right = axes.containers[0][0], axes.containers[1][0]
+        assert left.get_x() + left.get_width() <= right.get_x() + 1e-10
+
+
+@pytest.fixture
+def multi_table(plot_agent, table_path, tmp_path):
+    """Write a small table in the current CSV/JSON format."""
+    def write(columns, rows):
+        path = tmp_path / f"multi{table_path.suffix}"
+        if path.suffix == ".csv":
+            with path.open("w", newline="") as stream:
+                writer = csv.writer(stream)
+                writer.writerow(columns)
+                writer.writerows(rows)
+        else:
+            path.write_text(json.dumps({"columns": columns, "rows": rows, "caption": "Multiple series"}))
+        plot_agent.agent.get_artifact_file_path.return_value = path
+    return write
+
+
+@pytest.mark.parametrize("kind", ["line", "scatter", "bar"])
+async def test_missing_values_are_independent_per_series(
+    plot_agent, multi_table, context, event_queue, kind,
+):
+    multi_table(["x", "one", "two"], [[1, 10, None], [2, None, 200], [3, 30, 300]])
+    result = await plot_agent.agent._plot_table({
+        "table_artifact_id": "multi", "x_column": "x", "y_columns": ["one", "two"], "kind": kind,
+    }, context, event_queue)
+    assert result["status"] == "success"
+    axes = plot_agent.figures[0].axes[0]
+    if kind == "line":
+        first, second = axes.lines
+        assert list(first.get_xdata()) == [1, 2, 3]
+        assert list(second.get_xdata()) == [1, 2, 3]
+        assert list(first.get_ydata()[[0, 2]]) == [10, 30]
+        assert list(second.get_ydata()[[1, 2]]) == [200, 300]
+        assert first.get_ydata()[1] != first.get_ydata()[1]  # NaN leaves a gap.
+        assert second.get_ydata()[0] != second.get_ydata()[0]
+    elif kind == "scatter":
+        assert axes.collections[0].get_offsets().tolist() == [[1, 10], [3, 30]]
+        assert axes.collections[1].get_offsets().tolist() == [[2, 200], [3, 300]]
+    else:
+        assert [bar.get_height() for bar in axes.containers[0]] == [10, 30]
+        assert [bar.get_height() for bar in axes.containers[1]] == [200, 300]
+
+
+async def test_grouped_bars_with_categories(plot_agent, multi_table, context, event_queue):
+    multi_table(["cheese", "stock_kg", "sold_kg"], [["Gouda", 100, 20], ["Brie", 50, 10]])
+    result = await plot_agent.agent._plot_table({
+        "table_artifact_id": "multi", "x_column": "cheese",
+        "y_columns": ["stock_kg", "sold_kg"], "kind": "bar",
+    }, context, event_queue)
+    assert result["status"] == "success"
+    axes = plot_agent.figures[0].axes[0]
+    assert [text.get_text() for text in axes.get_xticklabels()] == ["Gouda", "Brie"]
+    assert [bar.get_height() for bar in axes.containers[0]] == [100, 50]
+    assert [bar.get_height() for bar in axes.containers[1]] == [20, 10]
+    centers = [[bar.get_x() + bar.get_width() / 2 for bar in group] for group in axes.containers]
+    assert centers[0] == pytest.approx([-0.2, 0.8])
+    assert centers[1] == pytest.approx([0.2, 1.2])
+    assert [text.get_text() for text in axes.get_legend().get_texts()] == ["Stock (kg)", "Sold (kg)"]
+
+
+@pytest.mark.parametrize("names, expected", [
+    ("traps_set", "array"),
+    ([""], "non-empty"),
+    ([None], "non-empty"),
+    ([3], "non-empty"),
+    (["traps_set", "unknown"], "Available columns"),
+    (["traps_set", "traps"], "Cannot uniquely match"),
+    (["traps_set", "TRAPS_SET"], "more than once"),
+])
+async def test_invalid_y_series(plot_agent, context, event_queue, names, expected):
+    result = await plot_agent.agent._plot_table({
+        "table_artifact_id": "mouse-table", "x_column": "night", "y_columns": names,
+    }, context, event_queue)
+    assert result["status"] == "error"
+    assert expected in result["error"]
+    plot_agent.agent.send_deeplynx_artifact.assert_not_awaited()
+
+
+@pytest.mark.parametrize("second, scale, expected", [
+    ("text", "linear", "numeric values"),
+    (None, "linear", "numeric values"),
+    (0, "log", "strictly positive"),
+    (-1, "log", "strictly positive"),
+])
+async def test_validate_every_y_series(
+    plot_agent, multi_table, context, event_queue, second, scale, expected,
+):
+    multi_table(["x", "one", "two"], [[1, 10, second]])
+    result = await plot_agent.agent._plot_table({
+        "table_artifact_id": "multi", "x_column": "x", "y_columns": ["one", "two"], "y_scale": scale,
+    }, context, event_queue)
+    assert result["status"] == "error"
+    assert "two" in result["error"]
+    assert expected in result["error"]
+    plot_agent.agent.send_deeplynx_artifact.assert_not_awaited()
+
+
+async def test_y_series_survive_x_column_form(plot_agent, context, event_queue):
+    agent = plot_agent.agent
+    assert await agent._plot_table({
+        "table_artifact_id": "mouse-table", "y_columns": ["traps_set", "traps_sprung"],
+    }, context, event_queue) == {}
+    fields = agent.send_input_required.await_args.kwargs["missing_inputs"]
+    assert [field.name for field in fields] == ["x_column"]
+    agent.get_provided_inputs.return_value = {"x_column": "night"}
+    result = await agent._plot_table({"y_columns": []}, context, event_queue)
+    assert result["status"] == "success"
+    assert result["y_columns"] == ["traps_set", "traps_sprung"]
+    assert agent.send_input_required.await_count == 1
+
+
+async def test_y_columns_take_precedence_over_legacy_input(plot_agent, context, event_queue):
+    result = await plot_agent.agent._plot_table({
+        "table_artifact_id": "mouse-table", "x_column": "night",
+        "y_column": "unknown", "y_columns": ["traps_set"],
+    }, context, event_queue)
+    assert result["status"] == "success"
+    assert result["y_columns"] == ["traps_set"]
+    assert result["y_column"] == "traps_set"

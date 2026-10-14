@@ -77,6 +77,33 @@ def _text(value: Any) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
+def _column_label(column: str) -> str:
+    """Format a header for display, preserving symbols and explicit units.
+
+    Recognize a small set of CSV unit suffixes; leave unfamiliar ones as text.
+    C/F alone are ambiguous, so interpret them as degrees only for temperature.
+    """
+    name, unit = column.strip(), ""
+    explicit = re.fullmatch(r"(.+?)\s*(?:\[([^\[\]]+)\]|\(([^()]+)\))", name)
+    if explicit:
+        name = explicit.group(1).strip()
+        unit = (explicit.group(2) or explicit.group(3)).strip()
+    else:
+        suffix = re.fullmatch(r"(.+)_(kg|mm|km|m|s|min|h|Pa|kPa|MPa|K|°C|°F)", name)
+        temperature = re.fullmatch(
+            r"((?:.*[_\s])?(?:temp|temperature))_([CF])", name, re.IGNORECASE,
+        )
+        if temperature:
+            name, unit = temperature.group(1), f"°{temperature.group(2).upper()}"
+        elif suffix:
+            name, unit = suffix.groups()
+    name = " ".join(name.replace("_", " ").split())
+    # Preserve one-letter scientific symbols, especially time t vs temperature T.
+    if len(name) > 1:
+        name = name[0].upper() + name[1:]
+    return f"{name} ({unit})" if unit else name
+
+
 def _error(message: str) -> dict[str, Any]:
     """A problem the user or the orchestrator can fix: reported, not raised.
 
@@ -417,7 +444,8 @@ class Team5TablePlotAgent(PrometheusAgent):
         if not valid.any():
             return _error("The selected columns have no rows with both x and y values.")
 
-        title = _text(options.get("title")) or f"{y_col} vs {x_col}"
+        x_label, y_label = _column_label(x_col), _column_label(y_col)
+        title = _text(options.get("title")) or f"{y_label} vs {x_label}"
         figure = Figure(figsize=(8, 5), layout="constrained")
         FigureCanvasAgg(figure)
         axes = figure.subplots()
@@ -433,7 +461,7 @@ class Team5TablePlotAgent(PrometheusAgent):
             axes.scatter(x[valid], y[valid])
         else:
             axes.plot(x[valid], y[valid])
-        axes.set(xlabel=x_col, ylabel=y_col, title=title)
+        axes.set(xlabel=x_label, ylabel=y_label, title=title)
         axes.tick_params(axis="x", labelrotation=30)
         try:
             storage_config = ConnectionConfig.from_env()

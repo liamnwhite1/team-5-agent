@@ -12,7 +12,7 @@ import pytest
 from matplotlib import image as mpimg
 from matplotlib.figure import Figure
 
-from agent import Team5TablePlotAgent
+from agent import Team5TablePlotAgent, _column_label
 
 FIXTURES = Path(__file__).parent
 OUTPUT = FIXTURES / "output"
@@ -82,6 +82,62 @@ def test_json_fixture_matches_csv():
     assert table["rows"] == rows
 
 
+@pytest.mark.parametrize("header, expected", [
+    ("tunnel_temperature_C", "Tunnel temperature (°C)"),
+    ("temp_F", "Temp (°F)"),
+    ("stock_kg", "Stock (kg)"),
+    ("elapsed_time_s", "Elapsed time (s)"),
+    ("pressure_kPa", "Pressure (kPa)"),
+    ("t [min]", "t (min)"),
+    ("T [K]", "T (K)"),
+    ("Core temp. [°C]", "Core temp. (°C)"),
+    ("Speed (km/h)", "Speed (km/h)"),
+    ("density [kg/m³]", "Density (kg/m³)"),
+    ("aroma_index [smellies]", "Aroma index (smellies)"),
+    ("mice_sighted", "Mice sighted"),
+    ("species_C", "Species C"),
+    ("sensor_xyz", "Sensor xyz"),
+    ("t", "t"),
+    ("T", "T"),
+])
+def test_column_label(header, expected):
+    assert _column_label(header) == expected
+
+
+@pytest.mark.parametrize("headers, labels", [
+    (["t [min]", "T [K]"], ["t (min)", "T (K)"]),
+    (["elapsed_time (s)", "pressure [kPa]"], ["Elapsed time (s)", "Pressure (kPa)"]),
+])
+async def test_plot_preserves_units_and_source_headers(
+    plot_agent, table_path, tmp_path, context, event_queue, headers, labels,
+):
+    path = tmp_path / f"measurements{table_path.suffix}"
+    rows = [[1, 300], [2, 310]]
+    caption = "Table 3. Measurements of temperature, pressure, and other conditions."
+    if path.suffix == ".csv":
+        with path.open("w", newline="") as stream:
+            writer = csv.writer(stream)
+            writer.writerow(headers)
+            writer.writerows(rows)
+    else:
+        path.write_text(json.dumps({"caption": caption, "columns": headers, "rows": rows}))
+    plot_agent.agent.get_artifact_file_path.return_value = path
+    result = await plot_agent.agent._plot_table({
+        "table_artifact_id": "measurements", "x_column": headers[0], "y_column": headers[1],
+    }, context, event_queue)
+
+    assert result["status"] == "success"
+    assert result["x_column"] == headers[0]
+    assert result["y_column"] == headers[1]
+    axes = plot_agent.figures[0].axes[0]
+    assert axes.get_xlabel() == labels[0]
+    assert axes.get_ylabel() == labels[1]
+    assert axes.get_title() == f"{labels[1]} vs {labels[0]}"
+    assert list(axes.lines[0].get_ydata()) == [300, 310]  # Display formatting never converts data.
+    metadata = plot_agent.uploads[0]["metadata"]
+    assert metadata["source_caption"] == (caption if path.suffix == ".json" else "")
+
+
 @pytest.mark.parametrize("kind", ["line", "scatter", "bar"])
 async def test_plot_data_and_png(plot_agent, context, event_queue, kind):
     agent = plot_agent.agent
@@ -107,8 +163,8 @@ async def test_plot_data_and_png(plot_agent, context, event_queue, kind):
         assert axes.collections[0].get_offsets().tolist() == expected_points
     else:
         assert [bar.get_height() for bar in axes.patches] == expected_y
-    assert axes.get_xlabel() == "night"
-    assert axes.get_ylabel() == "mice_sighted"
+    assert axes.get_xlabel() == "Night"
+    assert axes.get_ylabel() == "Mice sighted"
     assert axes.get_title() == "Mouse sightings"
     assert plot_agent.uploads[0]["description"] == "Mouse sightings"
     assert plot_agent.uploads[0]["mime_type"] == "image/png"
@@ -136,7 +192,7 @@ async def test_default_title_describes_selected_columns(
     result = await plot_agent.agent._plot_table(params, context, event_queue)
 
     assert result["status"] == "success"
-    expected_title = "tunnel_temperature_C vs night"
+    expected_title = "Tunnel temperature (°C) vs Night"
     assert plot_agent.figures[0].axes[0].get_title() == expected_title
     upload = plot_agent.uploads[0]
     assert upload["description"] == expected_title
@@ -160,8 +216,8 @@ async def test_bar_chart_with_text_categories(plot_agent, table_path, context, e
     axes = plot_agent.figures[0].axes[0]
     assert [label.get_text() for label in axes.get_xticklabels()] == ["Gouda", "Brie", "Cheddar"]
     assert [bar.get_height() for bar in axes.patches] == [1020, 650.5, 0]
-    assert axes.get_xlabel() == "cheese"
-    assert axes.get_ylabel() == "stock_kg"
+    assert axes.get_xlabel() == "Cheese"
+    assert axes.get_ylabel() == "Stock (kg)"
 
 
 @pytest.mark.parametrize("case", ["repeated-label", "missing-categories"])

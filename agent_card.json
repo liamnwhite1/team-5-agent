@@ -69,7 +69,7 @@
           },
           "title": {
             "type": "string",
-            "description": "Optional plot title. Defaults to the selected y column vs the selected x column."
+            "description": "Optional plot title. Defaults to readable selected column labels with units, in y vs x order. The source caption is preserved in artifact metadata."
           },
           "kind": {
             "type": "string",

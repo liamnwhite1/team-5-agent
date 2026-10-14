@@ -17,6 +17,7 @@ with the caption written above it, and the small LLM picks the one the user
 described. Plotting: see ``_plot_table``.
 """
 
+import csv
 import json
 import logging
 import math
@@ -214,6 +215,42 @@ def _artifact_name(caption: str, position: int) -> str:
     return slug or f"table_{position}"
 
 
+def _csv_problem(path: Path) -> str:
+    """What is wrong with a CSV file, or "" if nothing is.
+
+    pandas reads a malformed file by guessing: it pads a short row, makes the
+    first column the index when the first row is too long, and renames a
+    repeated column name to "name.1". The plot would then show shifted values
+    without an error, so the file is checked before pandas reads it.
+    """
+    try:
+        with path.open(encoding="utf-8-sig", newline="") as handle:
+            reader = csv.reader(handle, strict=True)
+            # Like pandas, skip lines that are empty or hold only spaces.
+            rows = [(reader.line_num, row) for row in reader if len(row) > 1 or "".join(row).strip()]
+    except UnicodeDecodeError:
+        return 'it is not UTF-8 text (in Excel, save it as "CSV UTF-8")'
+    except csv.Error as error:
+        return f"it is not valid CSV ({error})"
+    if not rows:
+        return "it is empty"
+    header = rows[0][1]
+    if len(header) == 1 and ("\t" in header[0] or ";" in header[0]):
+        separator = "tabs" if "\t" in header[0] else "semicolons"
+        return f"its columns are separated by {separator}, not commas"
+    names = [name.strip() for name in header if name.strip()]
+    repeated = [name for name in names if names.count(name) > 1]
+    if repeated:
+        return f"more than one column is named '{repeated[0]}'"
+    if names and all(isinstance(_clean_cell(name), (int, float)) for name in names):
+        return "its first row is data, not column names"
+    for number, (line, row) in enumerate(rows[1:], start=1):
+        if len(row) != len(header):
+            fields = "field" if len(row) == 1 else "fields"
+            return f"row {number} (line {line}) has {len(row)} {fields} but the header has {len(header)}"
+    return ""
+
+
 class Team5TablePlotAgent(PrometheusAgent):
     """Team-5 Table Plot Agent."""
 
@@ -390,6 +427,12 @@ class Team5TablePlotAgent(PrometheusAgent):
                 frame = pd.DataFrame(body["rows"], columns=body["columns"])
                 caption = _text(body.get("caption"))
             elif path.suffix.lower() == ".csv":
+                problem = _csv_problem(path)
+                if problem:
+                    return _error(
+                        f"The CSV file cannot be read as a table: {problem}. "
+                        "Fix the file and upload it again."
+                    )
                 frame = pd.read_csv(path, encoding="utf-8-sig", dtype=str)
             else:
                 return _error("Please provide a CSV file or a JSON table with columns and rows.")

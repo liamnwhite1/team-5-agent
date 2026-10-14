@@ -8,6 +8,21 @@
   },
   "skills": [
     {
+      "id": "team_5_extract_table",
+      "name": "Team-5 Table Extraction",
+      "description": "Find one table in an uploaded markdown document by matching the user's description against the table captions, parse it, and publish it as a table artifact with clean numeric columns.",
+      "usage_notes": "Use when the user refers to a table inside a markdown/text document. Not for CSV files: those can be plotted directly.",
+      "tags": ["table", "markdown", "extract"],
+      "inputSchema": { "type": "object",
+        "properties": {
+          "document_artifact_id": { "type": "string",
+            "x_artifact_ref": "single",
+            "description": "The markdown document artifact." },
+          "table_description": { "type": "string",
+            "description": "How the user referred to the table, e.g. 'the table with population data'." } },
+        "required": ["document_artifact_id", "table_description"] } 
+    },
+    {
       "id": "team_5_plot_table",
       "name": "Team-5 Table Plot Analysis",
       "description": "Plot columns of a table artifact or an uploaded CSV file as a png line, scatter, or bar chart. If the user name no columns, call it with only table_artifact_id: the skill asks, offering the real column names. Do not guess columns.",

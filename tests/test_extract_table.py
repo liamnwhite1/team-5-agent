@@ -188,7 +188,7 @@ async def test_the_plotter_reads_the_extracted_table(extract_agent, context, eve
     )
 
     assert result["status"] == "success"
-    # The caption travels with the plot; the default title names the columns instead.
+    assert upload.await_args.kwargs["description"] == "Brie Basin (residents) vs Year"
     assert upload.await_args.kwargs["metadata"]["source_caption"].startswith("Table 2. Census")
 
 

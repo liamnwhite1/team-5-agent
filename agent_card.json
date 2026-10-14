@@ -3,7 +3,7 @@
   "description": "Extracts and publishes a table that can be plotted.",
   "version": "1.0.0",
   "capabilities": {
-    "streaming": false,
+    "streaming": true,
     "pushNotifications": false
   },
   "skills": [
